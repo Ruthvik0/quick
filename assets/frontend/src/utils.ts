@@ -1,4 +1,3 @@
-// utils.ts
 export const fetchIpAddress = async (): Promise<{
   ip?: string;
   error?: string;

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	webview "github.com/webview/webview_go"
 )
@@ -12,19 +13,18 @@ import (
 type Message struct {
 	Sender  string `json:"sender"`
 	Content string `json:"content"`
+	Type    string `json:"type"` // "chat", "join", "quit"
 }
 
 type User struct {
 	username string
-	conn     net.Conn  // Connection to the user
-	messages []Message // Each user has their own slice of messages
+	conn     net.Conn
 }
 
 type Room struct {
 	roomID    string
 	roomOwner string
 	users     []User
-	messages  []Message  // Server-wide messages
 	mu        sync.Mutex // Mutex for concurrent access
 }
 
@@ -34,16 +34,10 @@ type CreateRoomResponse struct {
 	RoomID  string `json:"roomID"`
 }
 
-type JoinRoomResponse struct {
-	Success   bool   `json:"success"`
-	Error     string `json:"error"`
-	OwnerName string `json:"ownerName"`
-}
-
 var room Room
 
 func main() {
-	room = Room{users: make([]User, 0), messages: make([]Message, 0)}
+	room = Room{users: make([]User, 0)}
 
 	// Start the webview
 	w := webview.New(true)
@@ -55,9 +49,6 @@ func main() {
 
 	// Bind the functions
 	w.Bind("CreateRoom", createRoom)
-	w.Bind("JoinRoom", joinRoom)
-	w.Bind("SendMessage", sendMessage)
-	w.Bind("GetMessages", getMessages)
 
 	// Run the webview
 	w.Run()
@@ -70,78 +61,8 @@ func createRoom(ipAddress, username string) CreateRoomResponse {
 	room.roomID = ipAddress + ":3000"
 	room.roomOwner = username
 
-	conn, err := net.Dial("tcp", "127.0.0.1:3000")
-	if err != nil {
-		return CreateRoomResponse{Success: false, Error: "Could not connect to room"}
-	}
-
-	room.users = append(room.users, User{username: username, conn: conn, messages: []Message{}})
-	fmt.Println("Room created and user joined:", ipAddress, username)
+	fmt.Println("Room created ", ipAddress)
 	return CreateRoomResponse{Success: true, RoomID: room.roomID, Error: ""}
-}
-
-// joinRoom handles users joining an existing room
-func joinRoom(roomID, username string) JoinRoomResponse {
-	if roomID == "" || username == "" {
-		return JoinRoomResponse{Success: false, Error: "room ID and username are required"}
-	}
-
-	if room.roomID == "" || room.roomID != roomID {
-		return JoinRoomResponse{Success: false, Error: "Room does not exist"}
-	}
-
-	room.mu.Lock()
-	defer room.mu.Unlock()
-
-	for _, user := range room.users {
-		if user.username == username {
-			return JoinRoomResponse{Success: false, Error: "User already in the room"}
-		}
-	}
-
-	conn, err := net.Dial("tcp", room.roomID)
-	if err != nil {
-		return JoinRoomResponse{Success: false, Error: "Could not connect to room"}
-	}
-
-	newUser := User{username: username, conn: conn, messages: []Message{}}
-	room.users = append(room.users, newUser)
-	broadcastMessage(Message{Sender: "System", Content: username + " has joined the room!"})
-	fmt.Println("User joined room:", roomID, "by:", username)
-	return JoinRoomResponse{Success: true, OwnerName: room.roomOwner}
-}
-
-// sendMessage handles sending messages
-func sendMessage(sender, content string) {
-	room.mu.Lock()
-	defer room.mu.Unlock()
-
-	newMessage := Message{Sender: sender, Content: content}
-	room.messages = append(room.messages, newMessage)
-
-	// Append the message to the sender's messages
-	// for i := range room.users {
-	// 	if room.users[i].username == sender {
-	// 		room.users[i].messages = append(room.users[i].messages, newMessage)
-	// 		break
-	// 	}
-	// }
-
-	broadcastMessage(newMessage)
-}
-
-// getMessages retrieves the message history for the specified user
-func getMessages(username string) []Message {
-	room.mu.Lock()
-	defer room.mu.Unlock()
-
-	for _, user := range room.users {
-		if user.username == username {
-			// Return a copy of the user's messages
-			return append(make([]Message, 0), user.messages...)
-		}
-	}
-	return make([]Message, 0)
 }
 
 // startTCPServer starts a TCP server on the specified address
@@ -169,12 +90,35 @@ func startTCPServer(ipAddress string) {
 func handleConnection(conn net.Conn) {
 	defer conn.Close()
 
+	var username string
+
+	// Read the initial username
+	if err := conn.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		fmt.Printf("Error setting deadline: %v\n", err)
+		return
+	}
+
+	usernameBytes := make([]byte, 1024)
+	n, err := conn.Read(usernameBytes)
+	if err != nil {
+		fmt.Printf("Error reading username from %s: %v\n", conn.RemoteAddr(), err)
+		return
+	}
+	username = string(usernameBytes[:n])
+
+	room.mu.Lock()
+	room.users = append(room.users, User{username: username, conn: conn})
+	room.mu.Unlock()
+
+	broadcastMessage(Message{Sender: username, Type: "join", Content: fmt.Sprintf("%s has joined the chat!", username)})
+
+	// Handle incoming messages
 	for {
 		messageBytes := make([]byte, 1024)
 		n, err := conn.Read(messageBytes)
 		if err != nil {
 			fmt.Printf("Error reading message from %s: %v\n", conn.RemoteAddr(), err)
-			return
+			break
 		}
 
 		var message Message
@@ -183,9 +127,14 @@ func handleConnection(conn net.Conn) {
 			continue
 		}
 
-		// Broadcast the message, including the sender
+		// Broadcast the message
 		broadcastMessage(message)
 	}
+
+	// User disconnected
+	room.mu.Lock()
+	defer room.mu.Unlock()
+	broadcastMessage(Message{Sender: username, Type: "quit", Content: fmt.Sprintf("%s has left the chat.", username)})
 }
 
 // broadcastMessage sends a message to all users in the room
@@ -194,11 +143,10 @@ func broadcastMessage(message Message) {
 	defer room.mu.Unlock()
 
 	for _, user := range room.users {
-		user.messages = room.messages
-		// messageJSON, _ := json.Marshal(message)
-		// _, err := user.conn.Write(messageJSON)
-		// if err != nil {
-		// 	fmt.Printf("Error sending message to %s: %v\n", user.conn.RemoteAddr(), err)
-		// }
+		messageBytes, _ := json.Marshal(message)
+		_, err := user.conn.Write(messageBytes)
+		if err != nil {
+			fmt.Printf("Error sending message to %s: %v\n", user.username, err)
+		}
 	}
 }
